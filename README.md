@@ -92,6 +92,20 @@ Pon `?` en cada palabra que falta. Las posiciones pueden ser cualesquiera.
   --addr 0x6c141975f4057cdb7aed9aa16e0d4cbdb46d6d50
 ```
 
+### Orden desconocido — `--permute`
+
+Si conoces **las 12 palabras pero no el orden**, usa `--permute` (sin `?`):
+
+```bash
+# multi-GPU
+./buscar.sh --permute --phrase "legal winner thank year wave sausage worth useful legal will tell jar" --addr 0x6c14...6d50
+
+# una GPU
+./seed_search --permute --phrase "legal winner thank year wave sausage worth useful legal will tell jar" --addr 0x6c14...6d50
+```
+Son 12! = 479 millones de permutaciones, pero el checksum descarta ~15/16:
+**~9 min en 1 GPU, ~1 min en 8 GPUs.**
+
 ### Dirección parcial
 Si solo recuerdas el inicio y el final (como la muestra la wallet), usa `...`:
 

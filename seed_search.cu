@@ -364,6 +364,48 @@ __global__ void search_kernel(unsigned long long start, unsigned long long end,
   }
 }
 
+// ===================== modo permutaciones (orden desconocido) =====================
+__device__ __constant__ unsigned long long FACT12[12]={1ULL,1ULL,2ULL,6ULL,24ULL,120ULL,720ULL,5040ULL,40320ULL,362880ULL,3628800ULL,39916800ULL};
+__device__ void lehmer12(unsigned long long lin, const int base[12], int out[12]){
+  int avail[12];
+  #pragma unroll
+  for(int i=0;i<12;i++) avail[i]=base[i];
+  int m=12;
+  for(int i=0;i<12;i++){
+    unsigned long long f=FACT12[11-i];
+    int d=(int)(lin/f); lin%=f;
+    out[i]=avail[d];
+    for(int j=d;j<m-1;j++) avail[j]=avail[j+1];
+    m--;
+  }
+}
+__global__ void permute_kernel(unsigned long long start, unsigned long long end,
+                               const int* base_idx, int accounts,
+                               int pfx_n, const u8* pfx_nib, int sfx_n, const u8* sfx_nib){
+  unsigned long long tid=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
+  unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
+  for(unsigned long long lin=start+tid; lin<end; lin+=stride){
+    int idx[12]; lehmer12(lin, base_idx, idx);
+    if(!bip39_ok_12(idx)) continue;
+    char m[120]; int mlen=0;
+    for(int w=0;w<12;w++){ const char* wp=d_words[idx[w]]; for(int c=0; wp[c]; c++) m[mlen++]=wp[c]; if(w<11) m[mlen++]=' '; }
+    u8 seed[64]; pbkdf2_bip39((const u8*)m,mlen,(const u8*)"mnemonic",8,2048,seed);
+    for(int acc=0; acc<accounts; acc++){
+      u8 priv[32]; derive_eth(seed,acc,priv);
+      u64 k[4]; be32_to_fe(priv,k);
+      u64 x[4],y[4]; scalar_mul_G(k,x,y);
+      u8 pub[64]; fe_to_be32(x,pub); fe_to_be32(y,pub+32);
+      u8 hsh[32]; keccak256(pub,64,hsh);
+      u8 addr[20]; for(int i=0;i<20;i++) addr[i]=hsh[12+i];
+      int ok=1;
+      for(int i=0;i<pfx_n && ok;i++){ int nib=(i&1)?(addr[i/2]&0xF):(addr[i/2]>>4); if(nib!=pfx_nib[i]) ok=0; }
+      for(int i=0;i<sfx_n && ok;i++){ int p=40-sfx_n+i; int nib=(p&1)?(addr[p/2]&0xF):(addr[p/2]>>4); if(nib!=sfx_nib[i]) ok=0; }
+      if(ok){ int slot=atomicAdd(&g_result_count,1);
+        if(slot<MAX_RESULTS){ g_result_acc[slot]=acc; for(int i=0;i<mlen;i++) g_results[slot][i]=m[i]; g_results[slot][mlen]=0; } }
+    }
+  }
+}
+
 // ===================== host =====================
 static int word_to_index(const char* w){ for(int i=0;i<2048;i++) if(!strcmp(w,BIP39_WORDS[i])) return i; return -1; }
 static int hexval(char c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; }
@@ -388,7 +430,7 @@ static int parse_pattern(const char* s,u8* pfx,int* pn,u8* sfx,int* sn){
 
 int main(int argc,char**argv){
   const char* phrase=NULL; const char* addr=NULL; const char* outfile="hallazgos.txt";
-  int accounts=1, blocks=4096, threads=256, selftest=0;
+  int accounts=1, blocks=4096, threads=256, selftest=0, permute=0;
   unsigned long long arg_start=0, arg_end=0; int has_range=0; int gpu_label=-1;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--phrase")&&i+1<argc) phrase=argv[++i];
@@ -400,17 +442,24 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--start")&&i+1<argc){ arg_start=strtoull(argv[++i],0,10); has_range=1; }
     else if(!strcmp(argv[i],"--end")&&i+1<argc){ arg_end=strtoull(argv[++i],0,10); has_range=1; }
     else if(!strcmp(argv[i],"--gpu")&&i+1<argc) gpu_label=atoi(argv[++i]);
+    else if(!strcmp(argv[i],"--permute")) permute=1;
     else if(!strcmp(argv[i],"--selftest")) selftest=1;
   }
   upload_wordlist();
 
   if(selftest){
-    // esconde 2 palabras de la frase Hardhat y confirma que las recupera -> 0xf39f..2266
-    phrase="? test test test test test test test test test test ?";
+    if(permute){
+      // todas las palabras de Hardhat, orden desconocido -> debe hallar 0xf39f..2266
+      phrase="test test test test test test test test test test test junk";
+      printf("== SELF-TEST PERMUTE (orden desconocido, frase Hardhat) ==\n");
+    } else {
+      // esconde 2 palabras de la frase Hardhat y confirma que las recupera -> 0xf39f..2266
+      phrase="? test test test test test test test test test test ?";
+      printf("== SELF-TEST (esconde 2 palabras de la frase Hardhat) ==\n");
+    }
     addr="0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"; accounts=1;
-    printf("== SELF-TEST (esconde 2 palabras de la frase Hardhat) ==\n");
   }
-  if(!phrase||!addr){ printf("Uso: ./seed_search --phrase \"w1 ... ?\" --addr 0x...\n      (o --selftest)\n"); return 0; }
+  if(!phrase||!addr){ printf("Uso: ./seed_search --phrase \"w1 ... ?\" --addr 0x...\n      o (orden desconocido): --permute --phrase \"w1 w2 ... w12\" --addr 0x...\n"); return 0; }
 
   // parsear frase
   char tmp[512]; strncpy(tmp,phrase,511); tmp[511]=0;
@@ -422,16 +471,24 @@ int main(int argc,char**argv){
     nwords++; tok=strtok(NULL," ");
   }
   if(nwords!=12){ printf("La frase debe tener 12 palabras (tiene %d).\n",nwords); return 1; }
-  if(K<1){ printf("No hay palabras faltantes (pon ? donde falten).\n"); return 1; }
+  if(permute){
+    if(K>0){ printf("En modo --permute debes dar las 12 palabras conocidas, sin '?'.\n"); return 1; }
+  } else {
+    if(K<1){ printf("No hay palabras faltantes (pon ? donde falten, o usa --permute).\n"); return 1; }
+  }
 
   // parsear direccion
   u8 pfx[40],sfx[40]; int pn=0,sn=0;
   if(parse_pattern(addr,pfx,&pn,sfx,&sn)<0){ printf("Direccion invalida.\n"); return 1; }
   int known=pn+sn;
-  unsigned long long total=1; for(int i=0;i<K;i++) total*=2048ULL;
+  unsigned long long total;
+  if(permute) total=479001600ULL;                       // 12!
+  else { total=1; for(int i=0;i<K;i++) total*=2048ULL; } // 2048^K
   double valid=(double)total/16.0;
   double fp = known<40 ? valid/pow(16.0,known) : 0.0;
-  printf("Faltan %d palabra(s); direccion conocida = %d hex (%s).\n", K, known, known>=40?"completa":"parcial");
+  if(permute) printf("Modo PERMUTE: 12 palabras, orden desconocido = %llu permutaciones.\n", total);
+  else printf("Faltan %d palabra(s); ", K);
+  printf("Direccion conocida = %d hex (%s).\n", known, known>=40?"completa":"parcial");
   if(known<40) printf("Posibles falsos positivos: ~%.2g (se recolectan todos en %s).\n", fp, outfile);
   printf("Combinaciones: %llu  (checksum descarta ~15/16). Guardando en %s\n", total, outfile);
 
@@ -456,7 +513,8 @@ int main(int argc,char**argv){
   time_t t0=time(NULL);
   for(unsigned long long s=lo; s<hi; s+=CHUNK){
     unsigned long long e = s+CHUNK; if(e>hi) e=hi;
-    search_kernel<<<blocks,threads>>>(s,e,K,d_unk,d_fix,accounts,pn,d_pfx,sn,d_sfx);
+    if(permute) permute_kernel<<<blocks,threads>>>(s,e,d_fix,accounts,pn,d_pfx,sn,d_sfx);
+    else        search_kernel<<<blocks,threads>>>(s,e,K,d_unk,d_fix,accounts,pn,d_pfx,sn,d_sfx);
     cudaError_t err=cudaDeviceSynchronize();
     if(err!=cudaSuccess){ printf("CUDA error: %s\n",cudaGetErrorString(err)); return 1; }
     int cnt=0; cudaMemcpyFromSymbol(&cnt,g_result_count,sizeof(int));
@@ -468,6 +526,7 @@ int main(int argc,char**argv){
       for(int i=last_saved;i<n;i++){ printf("\n  *** COINCIDENCIA *** cuenta #%d  frase: %s\n",ha[i],hr[i]);
         if(fh){ fprintf(fh,"cuenta #%d\tfrase: %s\n",ha[i],hr[i]); fflush(fh);} }
       last_saved=cnt;
+      if(selftest) break;   // en self-test, con un acierto basta
     }
     unsigned long long done=e-lo;
     double prog= span? 100.0*(double)done/(double)span : 100.0;
