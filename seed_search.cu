@@ -52,14 +52,16 @@ __device__ __forceinline__ u64 ROTR(u64 x,int n){ return (x>>n)|(x<<(64-n)); }
 __device__ __forceinline__ u64 ld_be64(const u8* p){ return ((u64)p[0]<<56)|((u64)p[1]<<48)|((u64)p[2]<<40)|((u64)p[3]<<32)|((u64)p[4]<<24)|((u64)p[5]<<16)|((u64)p[6]<<8)|((u64)p[7]); }
 __device__ __forceinline__ void st_be64(u8* p,u64 v){ p[0]=v>>56;p[1]=v>>48;p[2]=v>>40;p[3]=v>>32;p[4]=v>>24;p[5]=v>>16;p[6]=v>>8;p[7]=v; }
 __device__ void sha512_transform(u64 st[8], const u8* block){
-  u64 w[80];
+  u64 w[16];
   #pragma unroll
   for(int i=0;i<16;i++) w[i]=ld_be64(block+i*8);
-  #pragma unroll
-  for(int i=16;i<80;i++) w[i]=SSIG1(w[i-2])+w[i-7]+SSIG0(w[i-15])+w[i-16];
   u64 a=st[0],b=st[1],c=st[2],d=st[3],e=st[4],f=st[5],g=st[6],h=st[7];
-  #pragma unroll
-  for(int i=0;i<80;i++){ u64 t1=h+BSIG1(e)+CHf(e,f,g)+K512[i]+w[i]; u64 t2=BSIG0(a)+MAJ(a,b,c); h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2; }
+  for(int i=0;i<80;i++){
+    u64 wi;
+    if(i<16) wi=w[i&15];
+    else { u64 w15=w[(i+1)&15], w2=w[(i+14)&15], w7=w[(i+9)&15], w16=w[i&15]; wi=SSIG1(w2)+w7+SSIG0(w15)+w16; w[i&15]=wi; }
+    u64 t1=h+BSIG1(e)+CHf(e,f,g)+K512[i]+wi; u64 t2=BSIG0(a)+MAJ(a,b,c); h=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=t1+t2;
+  }
   st[0]+=a;st[1]+=b;st[2]+=c;st[3]+=d;st[4]+=e;st[5]+=f;st[6]+=g;st[7]+=h;
 }
 __device__ void finalize_from_state(u64 st[8], const u8* tail, int taillen, u64 total_len, u8 out[64]){
@@ -438,7 +440,7 @@ int main(int argc,char**argv){
   int zero=0; cudaMemcpyToSymbol(g_result_count,&zero,sizeof(int));
 
   // busqueda por tramos (progreso + guardado parcial)
-  unsigned long long CHUNK= (1ULL<<28);
+  unsigned long long CHUNK= (1ULL<<25);
   int last_saved=0; FILE* fh=NULL;
   time_t t0=time(NULL);
   for(unsigned long long s=0; s<total; s+=CHUNK){
@@ -458,7 +460,13 @@ int main(int argc,char**argv){
     }
     double prog=100.0*(double)e/(double)total;
     double secs=(double)(time(NULL)-t0);
-    printf("\r  %.2f%%  %llu/%llu  %.0fs  hits=%d   ", prog,e,total,secs,cnt); fflush(stdout);
+    double eta = (e>0 && secs>0) ? secs*((double)total-e)/(double)e : 0.0;
+    char etabuf[32];
+    if(eta<60) snprintf(etabuf,32,"%.0fs",eta);
+    else if(eta<3600) snprintf(etabuf,32,"%.1fmin",eta/60);
+    else if(eta<86400) snprintf(etabuf,32,"%.1fh",eta/3600);
+    else snprintf(etabuf,32,"%.1fd",eta/86400);
+    printf("\r  %.2f%%  %llu/%llu  %.0fs  ETA %s  hits=%d   ", prog,e,total,secs,etabuf,cnt); fflush(stdout);
   }
   if(fh) fclose(fh);
   int cnt=0; cudaMemcpyFromSymbol(&cnt,g_result_count,sizeof(int));
