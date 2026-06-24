@@ -16,18 +16,19 @@ pública secp256k1, la dirección (keccak-256), y la compara con la tuya.
 ## Viabilidad (cuánto tarda según las palabras que faltan)
 
 Frase de 12 palabras, peor caso (espacio completo). **En promedio = la mitad.**
-Velocidad estimada ~3 millones de candidatos/seg por RTX 5090 (se confirma al correr).
+Velocidad **medida ~0.9 millones de candidatos/seg por RTX 5090**.
 
 | Faltan | Combinaciones | 1× RTX 5090 | 8× RTX 5090 |
 |---:|---:|---:|---:|
 | 1 | 2 048 | instantáneo | instantáneo |
-| 2 | 4 194 304 | instantáneo | instantáneo |
-| 3 | 8 589 934 592 | **~3 min** | **~22 s** |
-| 4 | 17 592 186 044 416 | ~4.3 días | ~12.8 h |
-| 5 | 36 028 797 018 963 968 | ~24 años ❌ | ~3 años ❌ |
+| 2 | 4 194 304 | ~5 s | instantáneo |
+| 3 | 8 589 934 592 | **~2.6 h** | **~20 min** |
+| 4 | 17 592 186 044 416 | ~226 días ❌ | ~28 días |
+| 5 | 36 028 797 018 963 968 | años ❌ | años ❌ |
 
-**Techo práctico: 4 palabras.** Cada palabra extra multiplica el tiempo ×2048.
-El PBKDF2 de 2048 iteraciones hace que cada candidato sea caro; por eso 5+ es inviable.
+**Sweet spot práctico: 2-3 palabras.** Con 8 GPUs, 3 palabras salen en ~20 min (peor caso)
+o ~10 min en promedio. 4 palabras solo es viable con muchas GPUs y paciencia. Cada palabra
+extra multiplica el tiempo ×2048; el PBKDF2 de 2048 iteraciones hace caro cada candidato.
 
 ---
 
@@ -68,17 +69,26 @@ llegando a `0xf39f…2266`. Debe terminar diciendo **TODO OK**.
 
 ## Uso
 
+### Multi-GPU (recomendado) — `buscar.sh`
+
+Reparte la búsqueda entre **todas las GPUs** y se detiene cuando encuentra la frase.
+
+```bash
+chmod +x buscar.sh
+./buscar.sh \
+  --phrase "? legal winner thank ? wolf abandon kit absurd net wing ?" \
+  --addr 0x6c141975f4057cdb7aed9aa16e0d4cbdb46d6d50
+```
+Detecta solas cuántas GPUs hay. Para forzar un número: `--gpus 8`. Muestra el progreso
+de cada GPU (`G0:12% G1:11% …`) y guarda la coincidencia en `hallazgos.txt`.
+
+### Una sola GPU — `seed_search`
+
 Pon `?` en cada palabra que falta. Las posiciones pueden ser cualesquiera.
 
 ```bash
-# Faltan la 1ª, la 5ª y la última (conoces la dirección completa)
 ./seed_search \
   --phrase "? legal winner thank ? wolf abandon kit absurd net wing ?" \
-  --addr 0x6c141975f4057cdb7aed9aa16e0d4cbdb46d6d50
-
-# Faltan las 3 últimas
-./seed_search \
-  --phrase "legal winner thank year wave sausage worth useful ? ? ?" \
   --addr 0x6c141975f4057cdb7aed9aa16e0d4cbdb46d6d50
 ```
 
@@ -109,18 +119,18 @@ así que aunque interrumpas no las pierdes.
 
 ---
 
-## Velocidad por GPU (orientativo)
+## Velocidad por GPU (medido)
 
-El cuello de botella es el **PBKDF2 de 2048 iteraciones** por candidato.
+El cuello de botella es el **PBKDF2 de 2048 iteraciones** por candidato. Sin spilling
+(SHA-512 con ventana deslizante).
 
 | GPU | candidatos/seg | Estado |
 |---|---|---|
-| RTX 5090 | ~3 M (estimado) | medir al correr |
-| RTX 4090 | ~2 M | estimado |
-| RTX 3090 | ~1 M | estimado |
+| RTX 5090 | **~0.9 M** | medido |
+| RTX 4090 | ~0.6 M | estimado |
+| RTX 3090 | ~0.3 M | estimado |
 
-Solo es estimación: la cifra real la verás en la barra de progreso al lanzar una búsqueda.
-Escala casi lineal con el número de GPUs.
+Escala casi lineal con el número de GPUs: 8× RTX 5090 ≈ ~7 M candidatos/seg.
 
 ---
 
@@ -144,6 +154,7 @@ fue validada por separado contra vectores oficiales antes de ensamblar.
 | Archivo | Para qué |
 |---|---|
 | `seed_search.cu` | Programa principal (todas las primitivas + búsqueda). |
+| `buscar.sh` | Lanzador multi-GPU (reparte y se detiene al encontrar). |
 | `gen_wordlist.py` | Genera `bip39_words.h` (wordlist oficial). Correr una vez. |
 | `seed_recover.py` | Oráculo de referencia en Python (CPU): valida y recupera 2 palabras. |
 | `README.md` | Este archivo. |

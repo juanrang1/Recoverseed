@@ -389,6 +389,7 @@ static int parse_pattern(const char* s,u8* pfx,int* pn,u8* sfx,int* sn){
 int main(int argc,char**argv){
   const char* phrase=NULL; const char* addr=NULL; const char* outfile="hallazgos.txt";
   int accounts=1, blocks=4096, threads=256, selftest=0;
+  unsigned long long arg_start=0, arg_end=0; int has_range=0; int gpu_label=-1;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--phrase")&&i+1<argc) phrase=argv[++i];
     else if(!strcmp(argv[i],"--addr")&&i+1<argc) addr=argv[++i];
@@ -396,6 +397,9 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--accounts")&&i+1<argc) accounts=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--blocks")&&i+1<argc) blocks=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--threads")&&i+1<argc) threads=atoi(argv[++i]);
+    else if(!strcmp(argv[i],"--start")&&i+1<argc){ arg_start=strtoull(argv[++i],0,10); has_range=1; }
+    else if(!strcmp(argv[i],"--end")&&i+1<argc){ arg_end=strtoull(argv[++i],0,10); has_range=1; }
+    else if(!strcmp(argv[i],"--gpu")&&i+1<argc) gpu_label=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--selftest")) selftest=1;
   }
   upload_wordlist();
@@ -439,12 +443,19 @@ int main(int argc,char**argv){
   cudaMalloc(&d_sfx,sn>0?sn:1); if(sn) cudaMemcpy(d_sfx,sfx,sn,cudaMemcpyHostToDevice);
   int zero=0; cudaMemcpyToSymbol(g_result_count,&zero,sizeof(int));
 
+  // rango asignado a esta instancia (multi-GPU); por defecto todo
+  unsigned long long lo = has_range ? arg_start : 0ULL;
+  unsigned long long hi = has_range ? arg_end   : total;
+  if(hi>total) hi=total;
+  unsigned long long span = (hi>lo)?(hi-lo):0;
+  char tag[24]; if(gpu_label>=0) snprintf(tag,24,"[GPU%d] ",gpu_label); else tag[0]=0;
+
   // busqueda por tramos (progreso + guardado parcial)
   unsigned long long CHUNK= (1ULL<<25);
   int last_saved=0; FILE* fh=NULL;
   time_t t0=time(NULL);
-  for(unsigned long long s=0; s<total; s+=CHUNK){
-    unsigned long long e = s+CHUNK; if(e>total) e=total;
+  for(unsigned long long s=lo; s<hi; s+=CHUNK){
+    unsigned long long e = s+CHUNK; if(e>hi) e=hi;
     search_kernel<<<blocks,threads>>>(s,e,K,d_unk,d_fix,accounts,pn,d_pfx,sn,d_sfx);
     cudaError_t err=cudaDeviceSynchronize();
     if(err!=cudaSuccess){ printf("CUDA error: %s\n",cudaGetErrorString(err)); return 1; }
@@ -458,15 +469,16 @@ int main(int argc,char**argv){
         if(fh){ fprintf(fh,"cuenta #%d\tfrase: %s\n",ha[i],hr[i]); fflush(fh);} }
       last_saved=cnt;
     }
-    double prog=100.0*(double)e/(double)total;
+    unsigned long long done=e-lo;
+    double prog= span? 100.0*(double)done/(double)span : 100.0;
     double secs=(double)(time(NULL)-t0);
-    double eta = (e>0 && secs>0) ? secs*((double)total-e)/(double)e : 0.0;
+    double eta = (done>0 && secs>0) ? secs*((double)span-done)/(double)done : 0.0;
     char etabuf[32];
     if(eta<60) snprintf(etabuf,32,"%.0fs",eta);
     else if(eta<3600) snprintf(etabuf,32,"%.1fmin",eta/60);
     else if(eta<86400) snprintf(etabuf,32,"%.1fh",eta/3600);
     else snprintf(etabuf,32,"%.1fd",eta/86400);
-    printf("\r  %.2f%%  %llu/%llu  %.0fs  ETA %s  hits=%d   ", prog,e,total,secs,etabuf,cnt); fflush(stdout);
+    printf("\r  %s%.2f%%  %llu/%llu  %.0fs  ETA %s  hits=%d   ", tag,prog,done,span,secs,etabuf,cnt); fflush(stdout);
   }
   if(fh) fclose(fh);
   int cnt=0; cudaMemcpyFromSymbol(&cnt,g_result_count,sizeof(int));
