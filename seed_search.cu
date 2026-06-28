@@ -328,6 +328,7 @@ __device__ void keccak256(const u8* in,int len,u8 out[32]){ u64 st[25]; for(int 
 __device__ char d_words[2048][9];
 #define MAX_RESULTS 256
 __device__ int  g_result_count;
+__device__ unsigned long long g_dump_count;
 __device__ int  g_result_acc[MAX_RESULTS];
 __device__ char g_results[MAX_RESULTS][120];
 
@@ -381,7 +382,8 @@ __device__ void lehmer12(unsigned long long lin, const int base[12], int out[12]
 }
 __global__ void permute_kernel(unsigned long long start, unsigned long long end,
                                const int* base_idx, int accounts,
-                               int pfx_n, const u8* pfx_nib, int sfx_n, const u8* sfx_nib){
+                               int pfx_n, const u8* pfx_nib, int sfx_n, const u8* sfx_nib,
+                               u8* dump, unsigned long long dump_cap, int dump_mode){
   unsigned long long tid=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long lin=start+tid; lin<end; lin+=stride){
@@ -397,6 +399,15 @@ __global__ void permute_kernel(unsigned long long start, unsigned long long end,
       u8 pub[64]; fe_to_be32(x,pub); fe_to_be32(y,pub+32);
       u8 hsh[32]; keccak256(pub,64,hsh);
       u8 addr[20]; for(int i=0;i<20;i++) addr[i]=hsh[12+i];
+      if(dump_mode){
+        // volcar TODA direccion candidata: registro de 32 bytes [lin:8][acc:1][pad:3][addr:20]
+        unsigned long long slot=atomicAdd(&g_dump_count,1ULL);
+        if(slot<dump_cap){ u8* rec=dump+slot*32;
+          for(int i=0;i<8;i++) rec[i]=(u8)(lin>>(8*i));
+          rec[8]=(u8)acc; rec[9]=0; rec[10]=0; rec[11]=0;
+          for(int i=0;i<20;i++) rec[12+i]=addr[i]; }
+        continue;
+      }
       int ok=1;
       for(int i=0;i<pfx_n && ok;i++){ int nib=(i&1)?(addr[i/2]&0xF):(addr[i/2]>>4); if(nib!=pfx_nib[i]) ok=0; }
       for(int i=0;i<sfx_n && ok;i++){ int p=40-sfx_n+i; int nib=(p&1)?(addr[p/2]&0xF):(addr[p/2]>>4); if(nib!=sfx_nib[i]) ok=0; }
@@ -430,12 +441,14 @@ static int parse_pattern(const char* s,u8* pfx,int* pn,u8* sfx,int* sn){
 
 int main(int argc,char**argv){
   const char* phrase=NULL; const char* addr=NULL; const char* outfile="hallazgos.txt";
+  const char* dumpfile=NULL; int dump_mode=0;
   int accounts=1, blocks=4096, threads=256, selftest=0, permute=0;
   unsigned long long arg_start=0, arg_end=0; int has_range=0; int gpu_label=-1;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--phrase")&&i+1<argc) phrase=argv[++i];
     else if(!strcmp(argv[i],"--addr")&&i+1<argc) addr=argv[++i];
     else if(!strcmp(argv[i],"--out")&&i+1<argc) outfile=argv[++i];
+    else if(!strcmp(argv[i],"--dump")&&i+1<argc){ dumpfile=argv[++i]; dump_mode=1; permute=1; }
     else if(!strcmp(argv[i],"--accounts")&&i+1<argc) accounts=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--blocks")&&i+1<argc) blocks=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--threads")&&i+1<argc) threads=atoi(argv[++i]);
@@ -459,7 +472,7 @@ int main(int argc,char**argv){
     }
     addr="0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"; accounts=1;
   }
-  if(!phrase||!addr){ printf("Uso: ./seed_search --phrase \"w1 ... ?\" --addr 0x...\n      o (orden desconocido): --permute --phrase \"w1 w2 ... w12\" --addr 0x...\n"); return 0; }
+  if(!phrase || (!addr && !dump_mode)){ printf("Uso:\n  Buscar (orden desconocido):  --permute --phrase \"w1..w12\" --addr 0x...\n  Volcar TODAS las candidatas: --dump candidatos.bin --phrase \"w1..w12\" [--accounts 2]\n"); return 0; }
 
   // parsear frase
   char tmp[512]; strncpy(tmp,phrase,511); tmp[511]=0;
@@ -477,9 +490,11 @@ int main(int argc,char**argv){
     if(K<1){ printf("No hay palabras faltantes (pon ? donde falten, o usa --permute).\n"); return 1; }
   }
 
-  // parsear direccion
+  // parsear direccion (en modo dump no hay direccion objetivo)
   u8 pfx[40],sfx[40]; int pn=0,sn=0;
-  if(parse_pattern(addr,pfx,&pn,sfx,&sn)<0){ printf("Direccion invalida.\n"); return 1; }
+  if(!dump_mode){
+    if(parse_pattern(addr,pfx,&pn,sfx,&sn)<0){ printf("Direccion invalida.\n"); return 1; }
+  }
   int known=pn+sn;
   unsigned long long total;
   if(permute) total=479001600ULL;                       // 12!
@@ -500,6 +515,16 @@ int main(int argc,char**argv){
   cudaMalloc(&d_sfx,sn>0?sn:1); if(sn) cudaMemcpy(d_sfx,sfx,sn,cudaMemcpyHostToDevice);
   int zero=0; cudaMemcpyToSymbol(g_result_count,&zero,sizeof(int));
 
+  // buffer de volcado (modo --dump): registros de 32 bytes por candidata
+  const unsigned long long DUMP_CAP = (1ULL<<23);   // 8.4M registros por tramo (margen)
+  u8* d_dump=NULL; FILE* fdump=NULL; unsigned long long dumped_total=0;
+  if(dump_mode){
+    if(cudaMalloc(&d_dump, DUMP_CAP*32)!=cudaSuccess){ printf("No hay memoria GPU para el buffer de volcado.\n"); return 1; }
+    fdump=fopen(dumpfile,"wb");
+    if(!fdump){ printf("No se pudo abrir %s para escribir.\n", dumpfile); return 1; }
+    printf("Modo VOLCADO: escribiendo TODAS las direcciones candidatas (cuentas 0..%d) en %s\n", accounts-1, dumpfile);
+  }
+
   // rango asignado a esta instancia (multi-GPU); por defecto todo
   unsigned long long lo = has_range ? arg_start : 0ULL;
   unsigned long long hi = has_range ? arg_end   : total;
@@ -510,13 +535,29 @@ int main(int argc,char**argv){
   // busqueda por tramos (progreso + guardado parcial)
   unsigned long long CHUNK= (1ULL<<25);
   int last_saved=0; FILE* fh=NULL;
+  u8* hostdump=NULL;
+  if(dump_mode){ hostdump=(u8*)malloc(DUMP_CAP*32); if(!hostdump){ printf("Sin memoria host para el volcado.\n"); return 1; } }
   time_t t0=time(NULL);
   for(unsigned long long s=lo; s<hi; s+=CHUNK){
     unsigned long long e = s+CHUNK; if(e>hi) e=hi;
-    if(permute) permute_kernel<<<blocks,threads>>>(s,e,d_fix,accounts,pn,d_pfx,sn,d_sfx);
+    if(dump_mode){ unsigned long long z=0; cudaMemcpyToSymbol(g_dump_count,&z,sizeof(z)); }
+    if(permute) permute_kernel<<<blocks,threads>>>(s,e,d_fix,accounts,pn,d_pfx,sn,d_sfx,d_dump,DUMP_CAP,dump_mode);
     else        search_kernel<<<blocks,threads>>>(s,e,K,d_unk,d_fix,accounts,pn,d_pfx,sn,d_sfx);
     cudaError_t err=cudaDeviceSynchronize();
     if(err!=cudaSuccess){ printf("CUDA error: %s\n",cudaGetErrorString(err)); return 1; }
+    if(dump_mode){
+      unsigned long long dc=0; cudaMemcpyFromSymbol(&dc,g_dump_count,sizeof(dc));
+      if(dc>DUMP_CAP){ printf("\nAVISO: tramo lleno (%llu > %llu). Baja CHUNK o sube DUMP_CAP.\n",dc,DUMP_CAP); dc=DUMP_CAP; }
+      if(dc>0){
+        cudaMemcpy(hostdump, d_dump, dc*32, cudaMemcpyDeviceToHost);
+        fwrite(hostdump, 32, dc, fdump); fflush(fdump);
+        dumped_total += dc;
+      }
+      unsigned long long done=e-lo; double prog= span? 100.0*(double)done/(double)span : 100.0;
+      double secs=(double)(time(NULL)-t0);
+      printf("\r  %s%.2f%%  %llu/%llu  %.0fs  volcadas=%llu   ", tag,prog,done,span,secs,dumped_total); fflush(stdout);
+      continue;
+    }
     int cnt=0; cudaMemcpyFromSymbol(&cnt,g_result_count,sizeof(int));
     if(cnt>last_saved){
       int n=cnt>MAX_RESULTS?MAX_RESULTS:cnt;
@@ -538,6 +579,14 @@ int main(int argc,char**argv){
     else if(eta<86400) snprintf(etabuf,32,"%.1fh",eta/3600);
     else snprintf(etabuf,32,"%.1fd",eta/86400);
     printf("\r  %s%.2f%%  %llu/%llu  %.0fs  ETA %s  hits=%d   ", tag,prog,done,span,secs,etabuf,cnt); fflush(stdout);
+  }
+  if(dump_mode){
+    if(fdump) fclose(fdump);
+    if(d_dump) cudaFree(d_dump);
+    if(hostdump) free(hostdump);
+    printf("\n\nVolcado terminado. %llu direcciones candidatas escritas en %s (registros de 32 bytes).\n", dumped_total, dumpfile);
+    printf("Ahora cruzalas contra la lista de saldos con cruzar.py.\n");
+    return 0;
   }
   if(fh) fclose(fh);
   int cnt=0; cudaMemcpyFromSymbol(&cnt,g_result_count,sizeof(int));
