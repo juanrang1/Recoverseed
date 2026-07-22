@@ -326,16 +326,42 @@ __device__ void keccak256(const u8* in,int len,u8 out[32]){ u64 st[25]; for(int 
 
 // ===================== wordlist + resultados en GPU =====================
 __device__ char d_words[2048][9];
-#define MAX_RESULTS 256
+#define MAX_RESULTS 2048
 __device__ int  g_result_count;
 __device__ unsigned long long g_dump_count;
 __device__ int  g_result_acc[MAX_RESULTS];
 __device__ char g_results[MAX_RESULTS][120];
+__device__ u8   g_result_addr[MAX_RESULTS][20];
+
+// ---- Bloom filter (device): consulta una direccion contra la base cargada ----
+__device__ __forceinline__ unsigned long long dmix64(unsigned long long x){
+  x += 0x9E3779B97F4A7C15ULL;
+  x = (x ^ (x>>30))*0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x>>27))*0x94D049BB133111EBULL;
+  return x ^ (x>>31);
+}
+__device__ __forceinline__ unsigned long long dfnv20(const u8* a, unsigned long long seed){
+  unsigned long long h=(1469598103934665603ULL ^ seed);
+  #pragma unroll
+  for(int i=0;i<20;i++){ h^=a[i]; h*=1099511628211ULL; }
+  return h;
+}
+__device__ __forceinline__ bool bloom_maybe(const unsigned int* bloom, unsigned long long nbits, int k, const u8* a){
+  unsigned long long h1=dmix64(dfnv20(a,0xA5A5ULL)), h2=dmix64(dfnv20(a,0x5A5AULL))|1ULL;
+  for(int i=0;i<k;i++){ unsigned long long idx=(h1+(unsigned long long)i*h2)%nbits; if(!(bloom[idx>>5]&(1u<<(idx&31)))) return false; }
+  return true;
+}
+__device__ __forceinline__ void record_hit(const char* m,int mlen,int acc,const u8* addr){
+  int slot=atomicAdd(&g_result_count,1);
+  if(slot<MAX_RESULTS){ g_result_acc[slot]=acc; for(int i=0;i<mlen;i++) g_results[slot][i]=m[i]; g_results[slot][mlen]=0;
+    for(int i=0;i<20;i++) g_result_addr[slot][i]=addr[i]; }
+}
 
 // ===================== kernel de busqueda =====================
 __global__ void search_kernel(unsigned long long start, unsigned long long end,
                               int K, const int* unknown_pos, const int* fixed_idx,
-                              int accounts, int pfx_n, const u8* pfx_nib, int sfx_n, const u8* sfx_nib){
+                              int accounts, int pfx_n, const u8* pfx_nib, int sfx_n, const u8* sfx_nib,
+                              const unsigned int* bloom, unsigned long long bloom_nbits, int bloom_k, int db_mode){
   unsigned long long tid=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long lin=start+tid; lin<end; lin+=stride){
@@ -356,11 +382,11 @@ __global__ void search_kernel(unsigned long long start, unsigned long long end,
       u8 pub[64]; fe_to_be32(x,pub); fe_to_be32(y,pub+32);
       u8 hsh[32]; keccak256(pub,64,hsh);
       u8 addr[20]; for(int i=0;i<20;i++) addr[i]=hsh[12+i];
+      if(db_mode){ if(bloom_maybe(bloom,bloom_nbits,bloom_k,addr)) record_hit(m,mlen,acc,addr); continue; }
       int ok=1;
       for(int i=0;i<pfx_n && ok;i++){ int nib=(i&1)?(addr[i/2]&0xF):(addr[i/2]>>4); if(nib!=pfx_nib[i]) ok=0; }
       for(int i=0;i<sfx_n && ok;i++){ int p=40-sfx_n+i; int nib=(p&1)?(addr[p/2]&0xF):(addr[p/2]>>4); if(nib!=sfx_nib[i]) ok=0; }
-      if(ok){ int slot=atomicAdd(&g_result_count,1);
-        if(slot<MAX_RESULTS){ g_result_acc[slot]=acc; for(int i=0;i<mlen;i++) g_results[slot][i]=m[i]; g_results[slot][mlen]=0; } }
+      if(ok) record_hit(m,mlen,acc,addr);
     }
   }
 }
@@ -383,7 +409,8 @@ __device__ void lehmer12(unsigned long long lin, const int base[12], int out[12]
 __global__ void permute_kernel(unsigned long long start, unsigned long long end,
                                const int* base_idx, int accounts,
                                int pfx_n, const u8* pfx_nib, int sfx_n, const u8* sfx_nib,
-                               u8* dump, unsigned long long dump_cap, int dump_mode){
+                               u8* dump, unsigned long long dump_cap, int dump_mode,
+                               const unsigned int* bloom, unsigned long long bloom_nbits, int bloom_k, int db_mode){
   unsigned long long tid=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
   unsigned long long stride=(unsigned long long)gridDim.x*blockDim.x;
   for(unsigned long long lin=start+tid; lin<end; lin+=stride){
@@ -408,11 +435,11 @@ __global__ void permute_kernel(unsigned long long start, unsigned long long end,
           for(int i=0;i<20;i++) rec[12+i]=addr[i]; }
         continue;
       }
+      if(db_mode){ if(bloom_maybe(bloom,bloom_nbits,bloom_k,addr)) record_hit(m,mlen,acc,addr); continue; }
       int ok=1;
       for(int i=0;i<pfx_n && ok;i++){ int nib=(i&1)?(addr[i/2]&0xF):(addr[i/2]>>4); if(nib!=pfx_nib[i]) ok=0; }
       for(int i=0;i<sfx_n && ok;i++){ int p=40-sfx_n+i; int nib=(p&1)?(addr[p/2]&0xF):(addr[p/2]>>4); if(nib!=sfx_nib[i]) ok=0; }
-      if(ok){ int slot=atomicAdd(&g_result_count,1);
-        if(slot<MAX_RESULTS){ g_result_acc[slot]=acc; for(int i=0;i<mlen;i++) g_results[slot][i]=m[i]; g_results[slot][mlen]=0; } }
+      if(ok) record_hit(m,mlen,acc,addr);
     }
   }
 }
@@ -439,9 +466,24 @@ static int parse_pattern(const char* s,u8* pfx,int* pn,u8* sfx,int* sn){
   *pn=np; *sn=ns; return 0;
 }
 
+// ---- helpers host para la base de datos (--basedatos) ----
+static u64 hmix64(u64 x){
+  x += 0x9E3779B97F4A7C15ULL;
+  x = (x ^ (x>>30))*0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x>>27))*0x94D049BB133111EBULL;
+  return x ^ (x>>31);
+}
+static u64 hfnv20(const u8* a, u64 seed){
+  u64 h=(1469598103934665603ULL ^ seed);
+  for(int i=0;i<20;i++){ h^=a[i]; h*=1099511628211ULL; }
+  return h;
+}
+static int cmp20(const void* a,const void* b){ return memcmp(a,b,20); }
+
 int main(int argc,char**argv){
   const char* phrase=NULL; const char* addr=NULL; const char* outfile="hallazgos.txt";
   const char* dumpfile=NULL; int dump_mode=0;
+  const char* dbfile=NULL; int db_mode=0;
   int accounts=1, blocks=4096, threads=256, selftest=0, permute=0;
   unsigned long long arg_start=0, arg_end=0; int has_range=0; int gpu_label=-1;
   for(int i=1;i<argc;i++){
@@ -449,6 +491,7 @@ int main(int argc,char**argv){
     else if(!strcmp(argv[i],"--addr")&&i+1<argc) addr=argv[++i];
     else if(!strcmp(argv[i],"--out")&&i+1<argc) outfile=argv[++i];
     else if(!strcmp(argv[i],"--dump")&&i+1<argc){ dumpfile=argv[++i]; dump_mode=1; permute=1; }
+    else if(!strcmp(argv[i],"--basedatos")&&i+1<argc){ dbfile=argv[++i]; db_mode=1; }
     else if(!strcmp(argv[i],"--accounts")&&i+1<argc) accounts=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--blocks")&&i+1<argc) blocks=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--threads")&&i+1<argc) threads=atoi(argv[++i]);
@@ -472,7 +515,7 @@ int main(int argc,char**argv){
     }
     addr="0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"; accounts=1;
   }
-  if(!phrase || (!addr && !dump_mode)){ printf("Uso:\n  Buscar (orden desconocido):  --permute --phrase \"w1..w12\" --addr 0x...\n  Volcar TODAS las candidatas: --dump candidatos.bin --phrase \"w1..w12\" [--accounts 2]\n"); return 0; }
+  if(!phrase || (!addr && !dump_mode && !db_mode)){ printf("Uso:\n  Buscar por direccion:        --permute --phrase \"w1..w12\" --addr 0x...\n  Buscar contra base de datos: --basedatos saldos.txt --phrase \"w1..w12\" [--permute] [--accounts 5]\n  Volcar TODAS las candidatas: --dump candidatos.bin --phrase \"w1..w12\" [--accounts 2]\n"); return 0; }
 
   // parsear frase
   char tmp[512]; strncpy(tmp,phrase,511); tmp[511]=0;
@@ -490,9 +533,9 @@ int main(int argc,char**argv){
     if(K<1){ printf("No hay palabras faltantes (pon ? donde falten, o usa --permute).\n"); return 1; }
   }
 
-  // parsear direccion (en modo dump no hay direccion objetivo)
+  // parsear direccion (en modo dump o base de datos no hay direccion objetivo unica)
   u8 pfx[40],sfx[40]; int pn=0,sn=0;
-  if(!dump_mode){
+  if(!dump_mode && !db_mode){
     if(parse_pattern(addr,pfx,&pn,sfx,&sn)<0){ printf("Direccion invalida.\n"); return 1; }
   }
   int known=pn+sn;
@@ -502,9 +545,13 @@ int main(int argc,char**argv){
   double valid=(double)total/16.0;
   double fp = known<40 ? valid/pow(16.0,known) : 0.0;
   if(permute) printf("Modo PERMUTE: 12 palabras, orden desconocido = %llu permutaciones.\n", total);
-  else printf("Faltan %d palabra(s); ", K);
-  printf("Direccion conocida = %d hex (%s).\n", known, known>=40?"completa":"parcial");
-  if(known<40) printf("Posibles falsos positivos: ~%.2g (se recolectan todos en %s).\n", fp, outfile);
+  else printf("Faltan %d palabra(s). ", K);
+  if(db_mode){
+    printf("Comparando contra base de datos (cuentas 0..%d).\n", accounts-1);
+  } else {
+    printf("Direccion conocida = %d hex (%s).\n", known, known>=40?"completa":"parcial");
+    if(known<40) printf("Posibles falsos positivos: ~%.2g (se recolectan todos en %s).\n", fp, outfile);
+  }
   printf("Combinaciones: %llu  (checksum descarta ~15/16). Guardando en %s\n", total, outfile);
 
   // subir arrays a GPU
@@ -514,6 +561,44 @@ int main(int argc,char**argv){
   cudaMalloc(&d_pfx,pn>0?pn:1); if(pn) cudaMemcpy(d_pfx,pfx,pn,cudaMemcpyHostToDevice);
   cudaMalloc(&d_sfx,sn>0?sn:1); if(sn) cudaMemcpy(d_sfx,sfx,sn,cudaMemcpyHostToDevice);
   int zero=0; cudaMemcpyToSymbol(g_result_count,&zero,sizeof(int));
+
+  // ---- modo base de datos (--basedatos): cargar direcciones + construir Bloom ----
+  unsigned int* d_bloom=NULL; unsigned long long bloom_nbits=0; int bloom_k=0;
+  u8* db_addrs=NULL; unsigned long long db_n=0;   // ordenadas, para verificacion final
+  if(db_mode){
+    FILE* fdb=fopen(dbfile,"r"); if(!fdb){ printf("No se pudo abrir la base %s\n",dbfile); return 1; }
+    unsigned long long cap=1ULL<<20; db_addrs=(u8*)malloc(cap*20); db_n=0;
+    char line[256];
+    while(fgets(line,sizeof(line),fdb)){
+      char* p=line; while(*p==' '||*p=='\t') p++;
+      if(p[0]=='0'&&(p[1]=='x'||p[1]=='X')) p+=2;
+      u8 tmp[20]; int ok=1;
+      for(int i=0;i<20;i++){ int hi=hexval(p[2*i]), lo=hexval(p[2*i+1]); if(hi<0||lo<0){ok=0;break;} tmp[i]=(u8)((hi<<4)|lo); }
+      if(!ok) continue;
+      if(db_n>=cap){ cap*=2; db_addrs=(u8*)realloc(db_addrs,cap*20); if(!db_addrs){ printf("Sin memoria cargando la base.\n"); return 1; } }
+      memcpy(db_addrs+db_n*20,tmp,20); db_n++;
+    }
+    fclose(fdb);
+    if(db_n==0){ printf("La base de datos no tiene direcciones validas (una por linea, 40 hex).\n"); return 1; }
+    printf("Base de datos: %llu direcciones cargadas.\n", db_n);
+    // construir Bloom (fp=1e-7)
+    double fpr=1e-7;
+    double mb=-(double)db_n*log(fpr)/(0.6931471806*0.6931471806);
+    bloom_nbits=(unsigned long long)mb; if(bloom_nbits<1024) bloom_nbits=1024; bloom_nbits=((bloom_nbits+31)/32)*32;
+    bloom_k=(int)(0.6931471806*(double)bloom_nbits/(double)db_n+0.5); if(bloom_k<1)bloom_k=1; if(bloom_k>30)bloom_k=30;
+    unsigned long long nwords=bloom_nbits/32;
+    unsigned int* h_bloom=(unsigned int*)calloc(nwords,sizeof(unsigned int));
+    if(!h_bloom){ printf("Sin memoria para el Bloom.\n"); return 1; }
+    for(unsigned long long i=0;i<db_n;i++){
+      u64 h1=hmix64(hfnv20(db_addrs+i*20,0xA5A5ULL)), h2=hmix64(hfnv20(db_addrs+i*20,0x5A5AULL))|1ULL;
+      for(int j=0;j<bloom_k;j++){ u64 idx=(h1+(u64)j*h2)%bloom_nbits; h_bloom[idx>>5]|=(1u<<(idx&31)); }
+    }
+    printf("Bloom: %.1f MB en GPU, k=%d.\n", nwords*4.0/1e6, bloom_k);
+    if(cudaMalloc(&d_bloom, nwords*sizeof(unsigned int))!=cudaSuccess){ printf("Sin memoria GPU para el Bloom.\n"); return 1; }
+    cudaMemcpy(d_bloom, h_bloom, nwords*sizeof(unsigned int), cudaMemcpyHostToDevice);
+    free(h_bloom);
+    qsort(db_addrs, db_n, 20, cmp20);   // ordenar para verificacion binaria
+  }
 
   // buffer de volcado (modo --dump): registros de 32 bytes por candidata
   const unsigned long long DUMP_CAP = (1ULL<<23);   // 8.4M registros por tramo (margen)
@@ -541,8 +626,8 @@ int main(int argc,char**argv){
   for(unsigned long long s=lo; s<hi; s+=CHUNK){
     unsigned long long e = s+CHUNK; if(e>hi) e=hi;
     if(dump_mode){ unsigned long long z=0; cudaMemcpyToSymbol(g_dump_count,&z,sizeof(z)); }
-    if(permute) permute_kernel<<<blocks,threads>>>(s,e,d_fix,accounts,pn,d_pfx,sn,d_sfx,d_dump,DUMP_CAP,dump_mode);
-    else        search_kernel<<<blocks,threads>>>(s,e,K,d_unk,d_fix,accounts,pn,d_pfx,sn,d_sfx);
+    if(permute) permute_kernel<<<blocks,threads>>>(s,e,d_fix,accounts,pn,d_pfx,sn,d_sfx,d_dump,DUMP_CAP,dump_mode,d_bloom,bloom_nbits,bloom_k,db_mode);
+    else        search_kernel<<<blocks,threads>>>(s,e,K,d_unk,d_fix,accounts,pn,d_pfx,sn,d_sfx,d_bloom,bloom_nbits,bloom_k,db_mode);
     cudaError_t err=cudaDeviceSynchronize();
     if(err!=cudaSuccess){ printf("CUDA error: %s\n",cudaGetErrorString(err)); return 1; }
     if(dump_mode){
@@ -561,11 +646,22 @@ int main(int argc,char**argv){
     int cnt=0; cudaMemcpyFromSymbol(&cnt,g_result_count,sizeof(int));
     if(cnt>last_saved){
       int n=cnt>MAX_RESULTS?MAX_RESULTS:cnt;
-      static char hr[MAX_RESULTS][120]; static int ha[MAX_RESULTS];
+      static char hr[MAX_RESULTS][120]; static int ha[MAX_RESULTS]; static u8 hd[MAX_RESULTS][20];
       cudaMemcpyFromSymbol(hr,g_results,sizeof(hr)); cudaMemcpyFromSymbol(ha,g_result_acc,sizeof(ha));
+      if(db_mode) cudaMemcpyFromSymbol(hd,g_result_addr,sizeof(hd));
       if(!fh) fh=fopen(outfile,"a");
-      for(int i=last_saved;i<n;i++){ printf("\n  *** COINCIDENCIA *** cuenta #%d  frase: %s\n",ha[i],hr[i]);
-        if(fh){ fprintf(fh,"cuenta #%d\tfrase: %s\n",ha[i],hr[i]); fflush(fh);} }
+      for(int i=last_saved;i<n;i++){
+        if(db_mode){
+          // verificar contra la base real -> elimina falsos positivos del Bloom
+          if(!bsearch(hd[i], db_addrs, db_n, 20, cmp20)) continue;
+          char ad[41]; for(int b=0;b<20;b++) sprintf(ad+b*2,"%02x",hd[i][b]);
+          printf("\n  *** COINCIDENCIA *** cuenta #%d  0x%s  frase: %s\n",ha[i],ad,hr[i]);
+          if(fh){ fprintf(fh,"cuenta #%d\t0x%s\t%s\n",ha[i],ad,hr[i]); fflush(fh);} 
+        } else {
+          printf("\n  *** COINCIDENCIA *** cuenta #%d  frase: %s\n",ha[i],hr[i]);
+          if(fh){ fprintf(fh,"cuenta #%d\tfrase: %s\n",ha[i],hr[i]); fflush(fh);} 
+        }
+      }
       last_saved=cnt;
       if(selftest) break;   // en self-test, con un acierto basta
     }
